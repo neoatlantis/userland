@@ -1,7 +1,4 @@
-/*
-Copyright (c) 2013, Broadcom Europe Ltd
-Copyright (c) 2013, James Hughes
-All rights reserved.
+/* Copyright (c) 2013, Broadcom Europe Ltd Copyright (c) 2013, James Hughes All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -46,6 +43,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  * We use the RaspiCamControl code to handle the specific camera settings.
  * We use the RaspiPreview code to handle the (generic) preview window
  */
+/*
+ * \date 24th Aug 2013
+ * \Author: Martin O'Hanlon (MaOH)
+ * 
+ * Custom version of RaspiVid which writes the current frame to a shared
+ * memory segment while it is encoded to a file, this is to allow an IPC
+ * from another program to help with data synchronisaton
+ */
 
 // We use some GNU extensions (basename)
 #define _GNU_SOURCE
@@ -55,7 +60,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <string.h>
 #include <memory.h>
 
-#define VERSION_STRING "v1.2"
+#define VERSION_STRING "v1.2a"
 
 #include "bcm_host.h"
 #include "interface/vcos/vcos.h"
@@ -73,6 +78,14 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "RaspiCLI.h"
 
 #include <semaphore.h>
+
+// MaOH - to manage shared memory ipc
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
+#include <time.h>
+#include <errno.h>
 
 /// Camera number to use - we only have one camera, indexed from 0.
 #define CAMERA_NUMBER 0
@@ -95,6 +108,15 @@ const int MAX_BITRATE = 30000000; // 30Mbits/s
 /// Interval at which we check for an failure abort during capture
 const int ABORT_INTERVAL = 100; // ms
 
+/// MaOH - Shared memory ipc constants
+///  - shared memory buffer size
+#define SHMBUFFERSIZE 10
+///  - semaphore timeout in milliseconds
+#define SEMTIMEOUTMS 10
+///  - shared memory key
+const key_t SHMKEY = 20130821;
+///  - semaphore key
+const key_t SEMKEY = 20130822;
 
 int mmal_status_to_int(MMAL_STATUS_T status);
 
@@ -132,6 +154,13 @@ typedef struct
    FILE *file_handle;                   /// File handle to write buffer data to.
    RASPIVID_STATE *pstate;              /// pointer to our state in case required in callback
    int abort;                           /// Set to 1 in callback if an error occurs to attempt to abort the capture
+   //FILE *datafile_handle;               /// MaOH - Debug File handle to write data too
+   uint32_t frame_count;                /// MaOH - Frame count
+   char *shared_memory;                 /// MaOH - Shared memory pointer for IPC
+   int semid;                           /// MaOH - Semaphore id
+   struct timespec sem_timeout;         /// MaOH - Shared memory timeout structure
+   struct sembuf sem_acquire_op;        /// MaOH - Shared memory acquire semaphore operation
+   struct sembuf sem_release_op;        /// MaOH - Shared memory release semaphore operation
 } PORT_USERDATA;
 
 static void display_valid_parameters(char *app_name);
@@ -231,7 +260,7 @@ static void dump_status(RASPIVID_STATE *state)
 static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
 {
    // Parse the command line arguments.
-   // We are looking for --<something> or -<abreviation of something>
+  // We are looking for --<something> or -<abreviation of something>
 
    int valid = 1;
    int i;
@@ -460,7 +489,6 @@ static void camera_control_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 
    mmal_buffer_header_release(buffer);
 }
-
 /**
  *  buffer header callback function for encoder
  *
@@ -489,6 +517,41 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
 
          bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
 
+         //MaOH - if the buffer ends in a frame, increment count and put in shared memory
+         if (buffer->flags & MMAL_BUFFER_HEADER_FLAG_FRAME_END)
+         {
+            //MaOH - incremenet frame count
+            pData->frame_count = pData->frame_count + 1;
+            //MaOH - acquire semaphore, if it times out just move on, we'll update it next time
+            if ((semtimedop(pData->semid, &pData->sem_acquire_op, 1, &pData->sem_timeout)) < 0)
+            {
+               //MaOH - semaphore has errored - has semaphore not timed out?
+               if (errno != EAGAIN)
+               {
+                  vcos_log_error("Could not perform shared memory semaphore acquire operation %s", strerror(errno));
+               }
+            }
+            else
+            {
+               //MaOH - cast the framecount as a string, it make consumption in other languages much easier
+               char sFrameCount[SHMBUFFERSIZE];
+               sprintf(sFrameCount, "%" PRIu32, pData->frame_count);
+
+               //MaOH - copy framecount to shared memory segment
+               memcpy(pData->shared_memory, &sFrameCount, sizeof(sFrameCount));
+               if ((semop(pData->semid, &pData->sem_release_op, 1)) < 0)
+               {
+                  vcos_log_error("Could not perform shared memory semaphore release operation");
+               }
+            }
+         }
+         //DEBUG
+         //MaOH - write data to data file
+         // do we have a time, if so write data
+         /*if (buffer->pts != MMAL_TIME_UNKNOWN)
+            fprintf(pData->datafile_handle, "%" PRId64 ",%" PRIu32 "\n", buffer->pts, pData->frame_count);
+         */
+
          mmal_buffer_header_mem_unlock(buffer);
       }
 
@@ -516,7 +579,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
       if (new_buffer)
          status = mmal_port_send_buffer(port, new_buffer);
 
-      if (!new_buffer || status != MMAL_SUCCESS)
+     if (!new_buffer || status != MMAL_SUCCESS)
          vcos_log_error("Unable to return a buffer to the encoder port");
    }
 }
@@ -925,6 +988,31 @@ int main(int argc, const char **argv)
    MMAL_PORT_T *encoder_output_port = NULL;
    FILE *output_file = NULL;
 
+   //MaOH - debug dataoutput file
+   //FILE *dataoutput_file = NULL;
+
+   //MaOH - shared memory variables
+   // - shared memory id
+   int shmid;
+   // - shared memory string
+   char *shared_memory;
+   // - semaphore id
+   int semid;
+   // - semaphore timeout
+   struct timespec sem_timeout;
+   sem_timeout.tv_sec = SEMTIMEOUTMS / 1000;
+   sem_timeout.tv_nsec = (SEMTIMEOUTMS % 1000) * 1000000;
+   // - semaphore operation (acquire)
+   struct sembuf sem_acquire_op;
+   sem_acquire_op.sem_num = 0;
+   sem_acquire_op.sem_op = -1;
+   sem_acquire_op.sem_flg = SEM_UNDO;
+   // - semaphore operation (release)
+   struct sembuf sem_release_op;
+   sem_release_op.sem_num = 0;
+   sem_release_op.sem_op = 1;
+   sem_acquire_op.sem_flg = SEM_UNDO;
+
    bcm_host_init();
 
    // Register our application with the logging system
@@ -1033,6 +1121,25 @@ int main(int argc, const char **argv)
                   fprintf(stderr, "Opening output file \"%s\"\n", state.filename);
 
                output_file = fopen(state.filename, "wb");
+
+               // MaOH - open debug output data file
+               //dataoutput_file = fopen("file.data", "w");
+
+               // MaOH - setup shared memory for framecount
+               if ((shmid = shmget(SHMKEY, SHMBUFFERSIZE, IPC_CREAT | 0666)) < 0)
+               {
+                  vcos_log_error("%s: Error creating shared memory\n", __func__);
+               }
+               if ((shared_memory = shmat(shmid, NULL, 0)) == (char *) -1) {
+                  vcos_log_error("%s: Error attaching shared memory\n", __func__);
+               }
+               // MaOH - setup shared memory semaphore
+               if ((semid = semget(SEMKEY, 1, IPC_CREAT | 0666)) < 0)
+               {
+                  vcos_log_error("%s: Error created shared memory semaphore\n", __func__);
+               }
+               //Set semaphore initial value to 1
+               semctl(semid,0,SETVAL,1);
             }
 
             if (!output_file)
@@ -1046,6 +1153,20 @@ int main(int argc, const char **argv)
          callback_data.file_handle = output_file;
          callback_data.pstate = &state;
          callback_data.abort = 0;
+         // MaOH - Persist debug data output file handle
+         //callback_data.datafile_handle = dataoutput_file;
+         // MaOH - Persist shared memory values into callback data
+         //  - Set frame count
+         callback_data.frame_count = 0;
+         //  - Set shared memory
+         callback_data.shared_memory = shared_memory;
+         //  - Set semaphore id
+         callback_data.semid = semid;
+         //  - Set semaphore timeout
+         callback_data.sem_timeout = sem_timeout;
+         //  - Set semaphore operations (acquire and release)
+         callback_data.sem_acquire_op = sem_acquire_op;
+         callback_data.sem_release_op = sem_release_op;
 
          encoder_output_port->userdata = (struct MMAL_PORT_USERDATA_T *)&callback_data;
 
@@ -1155,7 +1276,17 @@ error:
       // Can now close our file. Note disabling ports may flush buffers which causes
       // problems if we have already closed the file!
       if (output_file && output_file != stdout)
+         {
          fclose(output_file);
+         //MaOH - close debug data output file
+         //fclose(dataoutput_file);
+         //MaOH - remove semaphore
+         // Remove semaphore
+         semctl(semid, 0, IPC_RMID);
+         //MaOH - detach and remove shared memory
+         shmdt(shmid);
+         shmctl(shmid, IPC_RMID, NULL);
+         }
 
       /* Disable components */
       if (state.encoder_component)
