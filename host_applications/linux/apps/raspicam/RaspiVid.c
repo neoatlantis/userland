@@ -1114,6 +1114,26 @@ int main(int argc, const char **argv)
 
                // Ensure we don't upset the output stream with diagnostics/info
                state.verbose = 0;
+
+               // ---------- NeoAtlantis Modification begin #1
+
+               // MaOH - setup shared memory for framecount
+               if ((shmid = shmget(SHMKEY, SHMBUFFERSIZE, IPC_CREAT | 0666)) < 0)
+               {
+                  vcos_log_error("%s: Error creating shared memory\n", __func__);
+               }
+               if ((shared_memory = shmat(shmid, NULL, 0)) == (char *) -1) {
+                  vcos_log_error("%s: Error attaching shared memory\n", __func__);
+               }
+               // MaOH - setup shared memory semaphore
+               if ((semid = semget(SEMKEY, 1, IPC_CREAT | 0666)) < 0)
+               {
+                  vcos_log_error("%s: Error created shared memory semaphore\n", __func__);
+               }
+               //Set semaphore initial value to 1
+               semctl(semid,0,SETVAL,1);
+
+               // ---------- NeoAtlantis Modification end #1
             }
             else
             {
